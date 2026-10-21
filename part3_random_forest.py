@@ -1,61 +1,93 @@
-"""Part 3: random forest, sampling four candidate features at every split."""
 import numpy as np
-from common import (DecisionTree, MajorityVoteEnsemble, load_dataset, stratified_split,
-                    print_acc, species_family_mapping, derived_family_predictions)
+from common import load_data, stratified_split, get_accuracy, get_species_to_family
+from part1_decision_tree import DecisionTree
+from part2_bagging_boosting import Bagging
 
-
-class RandomForestClassifier:
-    def __init__(self, n_estimators=50, criterion="gini", max_features=4, rng_seed=42):
-        self.n_estimators, self.criterion = n_estimators, criterion
-        self.max_features, self.rng_seed = max_features, rng_seed
-        self.trees, self.classes_ = [], None
+class RandomForest:
+    def __init__(self, n_estimators=50, criterion="gini", max_features=4, seed=42):
+        self.n_estimators = n_estimators
+        self.criterion = criterion
+        self.max_features = max_features
+        self.seed = seed
+        self.trees = []
 
     def fit(self, X, y):
-        X, y = np.asarray(X), np.asarray(y)
-        self.classes_ = np.unique(y)
-        rng = np.random.RandomState(self.rng_seed)  # shared RNG for this forest's bootstrap and split subsets
+        # One fresh RandomState per ensemble model for ALL its randomness
+        self.n_classes = np.max(y) + 1
+        rng = np.random.RandomState(self.seed)
+        N = len(X)
         self.trees = []
-        n = len(y)
+        
         for _ in range(self.n_estimators):
-            indices = rng.randint(0, n, size=n)
-            tree = DecisionTree(criterion=self.criterion, max_depth=None, min_samples_split=2,
-                                max_features=self.max_features, rng=rng)
+            indices = rng.randint(0, N, size=N)
+            # Pass the SAME rng object to the tree so it handles feature subsetting from the same state
+            tree = DecisionTree(
+                criterion=self.criterion, 
+                max_features=self.max_features, 
+                rng=rng
+            )
             tree.fit(X[indices], y[indices])
             self.trees.append(tree)
-        self.voter_ = MajorityVoteEnsemble(self.trees, self.classes_)
-        return self
 
     def predict(self, X):
-        return self.voter_.predict(X)
+        all_preds = np.array([tree.predict(X) for tree in self.trees])
+        return np.apply_along_axis(
+            lambda x: np.bincount(x, minlength=self.n_classes).argmax(), 
+            axis=0, 
+            arr=all_preds
+        )
 
-
-def mean_pairwise_agreement(trees, X):
-    """Optional: mean fraction of test rows where two trees agree."""
-    pred = np.vstack([tree.predict(X) for tree in trees])
-    values = []
-    for i in range(len(trees)):
-        for j in range(i + 1, len(trees)):
-            values.append(np.mean(pred[i] == pred[j]))
-    return float(np.mean(values)) if values else float("nan")
-
-
-def main():
-    X, species, family, _ = load_dataset()
-    train_idx, test_idx = stratified_split(species)
-    Xtr, Xte = X[train_idx], X[test_idx]
-    ytr, yte = species[train_idx], species[test_idx]
-    ftr, fte = family[train_idx], family[test_idx]
-    mapping = species_family_mapping(ytr, ftr)
-    print("PART 3: RANDOM FOREST")
-    for criterion in ("gini", "entropy"):
-        forest = RandomForestClassifier(50, criterion, max_features=4).fit(Xtr, ytr)
-        print(f"\nRandom Forest | {criterion} | 50 trees | max_features=4")
-        print_acc("  Species train accuracy", ytr, forest.predict(Xtr))
-        pred_test = forest.predict(Xte)
-        print_acc("  Species test accuracy", yte, pred_test)
-        print_acc("  Derived family test accuracy", fte, derived_family_predictions(pred_test, mapping))
-        print(f"  Mean pairwise test-prediction agreement: {100*mean_pairwise_agreement(forest.trees, Xte):.2f}% (extra)")
-
+def pairwise_agreement(trees, X):
+    """Calculates the average pairwise agreement of test predictions (Extra task)."""
+    n_trees = len(trees)
+    all_preds = np.array([tree.predict(X) for tree in trees])
+    agreements = []
+    
+    for i in range(n_trees):
+        for j in range(i + 1, n_trees):
+            agree_fraction = np.mean(all_preds[i] == all_preds[j])
+            agreements.append(agree_fraction)
+            
+    return np.mean(agreements)
 
 if __name__ == "__main__":
-    main()
+    # Note: load_data now returns 3 variables
+    X, y_species, y_family, family_classes = load_data()
+    train_idx, test_idx = stratified_split(y_species, test_frac=0.2, seed=42)
+    X_train, y_train, X_test, y_test = X[train_idx], y_species[train_idx], X[test_idx], y_species[test_idx]
+    
+    # Build mapping from train only
+    species_to_family = get_species_to_family(y_train, y_family[train_idx])
+    y_family_test = y_family[test_idx]
+
+    print("=== Random Forest (T=50, m=4, max_depth=None) ===")
+    for criterion in ["gini", "entropy"]:
+        rf = RandomForest(criterion=criterion, max_features=4)
+        rf.fit(X_train, y_train)
+        
+        train_acc = get_accuracy(y_train, rf.predict(X_train)) * 100
+        preds_test = rf.predict(X_test)
+        test_acc = get_accuracy(y_test, preds_test) * 100
+        family_acc = get_accuracy(y_family_test, np.array([species_to_family[p] for p in preds_test])) * 100
+        
+        print(f"Criterion: {criterion.capitalize()}")
+        print(f"  Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | Derived Family Acc: {family_acc:.2f}%")
+        
+        # Extra: Compare agreement with Bagging
+        bagging_50 = Bagging(n_estimators=50, criterion=criterion)
+        bagging_50.fit(X_train, y_train)
+        
+        # Train baseline models for self-contained comparison
+        single_tree = DecisionTree(criterion=criterion)
+        single_tree.fit(X_train, y_train)
+        bagging_25 = Bagging(n_estimators=25, criterion=criterion)
+        bagging_25.fit(X_train, y_train)
+        
+        rf_agreement = pairwise_agreement(rf.trees, X_test) * 100
+        bag_agreement = pairwise_agreement(bagging_50.trees, X_test) * 100
+        
+        single_acc = get_accuracy(y_test, single_tree.predict(X_test)) * 100
+        bag_25_acc = get_accuracy(y_test, bagging_25.predict(X_test)) * 100
+        
+        print(f"  [Pairwise Agreement on Test Set] RF (T=50): {rf_agreement:.2f}% vs Bagging (T=50): {bag_agreement:.2f}%")
+        print(f"  [Accuracy Comparison] Single Tree: {single_acc:.2f}% | Bagging (T=25): {bag_25_acc:.2f}% | RF (T=50): {test_acc:.2f}%\n")

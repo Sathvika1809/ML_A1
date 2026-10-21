@@ -1,257 +1,124 @@
-
-"""Part 2: Bagging and multiclass AdaBoost.SAMME."""
-
 import numpy as np
+from common import load_data, stratified_split, get_accuracy, get_species_to_family
+from part1_decision_tree import DecisionTree
 
-from common import (
-    DecisionTree,
-    MajorityVoteEnsemble,
-    load_dataset,
-    stratified_split,
-    accuracy,
-    print_acc,
-    species_family_mapping,
-    derived_family_predictions,
-)
-
-
-class BaggingClassifier:
-    def __init__(self, n_estimators=25, criterion="gini", rng_seed=42):
+class Bagging:
+    def __init__(self, n_estimators=25, criterion="gini", seed=42):
         self.n_estimators = n_estimators
         self.criterion = criterion
-        self.rng_seed = rng_seed
+        self.seed = seed
         self.trees = []
-        self.classes_ = None
 
     def fit(self, X, y):
-        X = np.asarray(X)
-        y = np.asarray(y)
-
-        self.classes_ = np.unique(y)
-        rng = np.random.RandomState(self.rng_seed)
-
+        self.n_classes = np.max(y) + 1
+        # One fresh RandomState per ensemble model
+        rng = np.random.RandomState(self.seed)
+        N = len(X)
         self.trees = []
-        n = len(y)
-
+        
         for _ in range(self.n_estimators):
-            # Draw a bootstrap sample of the original training set.
-            indices = rng.randint(0, n, size=n)
-
-            tree = DecisionTree(
-                criterion=self.criterion,
-                max_depth=None,
-                min_samples_split=2,
-            )
+            # Bootstrap sample of N rows with replacement
+            indices = rng.randint(0, N, size=N)
+            tree = DecisionTree(criterion=self.criterion)
             tree.fit(X[indices], y[indices])
             self.trees.append(tree)
 
-        self.voter_ = MajorityVoteEnsemble(self.trees, self.classes_)
-        return self
-
     def predict(self, X):
-        return self.voter_.predict(X)
-
+        all_preds = np.array([tree.predict(X) for tree in self.trees])
+        return np.apply_along_axis(lambda x: np.bincount(x, minlength=self.n_classes).argmax(), axis=0, arr=all_preds)
 
 class AdaBoostSAMME:
-    def __init__(
-        self,
-        n_estimators=50,
-        criterion="gini",
-        max_depth=3,
-        rng_seed=42,
-    ):
+    def __init__(self, n_estimators=50, criterion="gini", max_depth=3):
         self.n_estimators = n_estimators
         self.criterion = criterion
         self.max_depth = max_depth
-        self.rng_seed = rng_seed
-
-        self.trees = []
-        self.alphas = []
-        self.classes_ = None
+        self.models = [] # Stores tuples of (alpha, tree)
+        self.K = None
 
     def fit(self, X, y):
-        X = np.asarray(X)
-        y = np.asarray(y)
+        self.n_classes = np.max(y) + 1
+        N = len(X)
+        self.K = np.max(y) + 1
+        w = np.ones(N) / N
+        self.models = []
 
-        n = len(y)
-        self.classes_ = np.unique(y)
-        K = len(self.classes_)
-
-        # Start with uniform sample weights.
-        weights = np.full(n, 1.0 / n, dtype=float)
-
-        # Keep a reproducible ensemble RNG.
-        self.rng_ = np.random.RandomState(self.rng_seed)
-
-        self.trees = []
-        self.alphas = []
-
-        for _ in range(self.n_estimators):
-            tree = DecisionTree(
-                criterion=self.criterion,
-                max_depth=self.max_depth,
-                min_samples_split=2,
-            )
-
-            # Train the weak learner using the current sample weights.
-            tree.fit(X, y, sample_weight=weights)
-
-            pred = tree.predict(X)
-            incorrect = pred != y
-
-            err = float(np.sum(weights * incorrect))
-
-            # Prevent numerical issues in the SAMME weight calculation.
-            err = float(np.clip(err, 1e-10, 1.0 - 1e-10))
-
-            # Required SAMME stopping rule:
-            # discard this learner and stop if its error is too high.
-            if err >= 1.0 - 1.0 / K:
-                break
-
-            # Multiclass SAMME learner weight.
-            alpha = np.log((1.0 - err) / err) + np.log(K - 1)
-
-            # Retain only learners that pass the error threshold.
-            self.trees.append(tree)
-            self.alphas.append(float(alpha))
-
-            # Increase the weights of misclassified samples.
-            weights *= np.exp(alpha * incorrect.astype(float))
-
-            weights_sum = weights.sum()
-
-            if not np.isfinite(weights_sum) or weights_sum <= 0:
-                raise FloatingPointError(
-                    "AdaBoost sample weights became invalid."
-                )
-
-            # Normalize weights for the next boosting round.
-            weights /= weights_sum
-
-            # Stop when the learner makes effectively no weighted errors.
-            if err <= 1e-10:
-                break
-
-        if not self.trees:
-            raise RuntimeError(
-                "AdaBoost could not retain any weak learner."
-            )
-
-        return self
+        for t in range(self.n_estimators):
+            tree = DecisionTree(criterion=self.criterion, max_depth=self.max_depth)
+            tree.fit(X, y, sample_weight=w)
+            
+            preds = tree.predict(X)
+            
+            # Weighted error
+            misclassified = (preds != y)
+            err = np.sum(w[misclassified])
+            err = np.clip(err, 1e-10, 1 - 1e-10)
+            
+            if err >= 1.0 - (1.0 / self.K):
+                break # Model is no better than random guessing
+                
+            # Amount of say (SAMME alpha)
+            alpha = np.log((1.0 - err) / err) + np.log(self.K - 1)
+            
+            # Update weights
+            w = w * np.exp(alpha * misclassified)
+            w = w / np.sum(w) # Normalise
+            
+            self.models.append((alpha, tree))
 
     def predict(self, X):
-        X = np.asarray(X)
-
-        scores = np.zeros(
-            (len(X), len(self.classes_)),
-            dtype=float,
-        )
-
-        class_to_index = {
-            cls: i for i, cls in enumerate(self.classes_.tolist())
-        }
-
-        for tree, alpha in zip(self.trees, self.alphas):
-            pred = tree.predict(X)
-
-            for cls in self.classes_:
-                scores[:, class_to_index[cls]] += alpha * (pred == cls)
-
-        return self.classes_[np.argmax(scores, axis=1)]
-
-
-def report(name, model, Xtr, ytr, Xte, yte, fte, mapping):
-    pred_train = model.predict(Xtr)
-    pred_test = model.predict(Xte)
-
-    print(f"\n{name}")
-
-    print_acc(
-        "  Species train accuracy",
-        ytr,
-        pred_train,
-    )
-
-    print_acc(
-        "  Species test accuracy",
-        yte,
-        pred_test,
-    )
-
-    print_acc(
-        "  Derived family test accuracy",
-        fte,
-        derived_family_predictions(pred_test, mapping),
-    )
-
-    return accuracy(yte, pred_test)
-
-
-def main():
-    X, species, family, _ = load_dataset()
-
-    # Use the assignment-prescribed shared stratified split.
-    train_idx, test_idx = stratified_split(species)
-
-    Xtr, Xte = X[train_idx], X[test_idx]
-    ytr, yte = species[train_idx], species[test_idx]
-    fte = family[test_idx]
-
-    mapping = species_family_mapping(
-        ytr,
-        family[train_idx],
-    )
-
-    print("PART 2: BAGGING AND ADABOOST SAMME")
-
-    for criterion in ("gini", "entropy"):
-        # Bagging: 25 bootstrap decision trees.
-        bag = BaggingClassifier(
-            n_estimators=25,
-            criterion=criterion,
-        ).fit(Xtr, ytr)
-
-        report(
-            f"Bagging | {criterion} | 25 trees",
-            bag,
-            Xtr, ytr,
-            Xte, yte,
-            fte, mapping,
-        )
-
-        # AdaBoost SAMME: 50 rounds, depth-3 weak learners.
-        boost3 = AdaBoostSAMME(
-            n_estimators=50,
-            criterion=criterion,
-            max_depth=3,
-        ).fit(Xtr, ytr)
-
-        report(
-            f"AdaBoost SAMME | {criterion} | depth=3 "
-            f"| retained={len(boost3.trees)}",
-            boost3,
-            Xtr, ytr,
-            Xte, yte,
-            fte, mapping,
-        )
-
-        # Additional depth-1 stump comparison.
-        boost1 = AdaBoostSAMME(
-            n_estimators=50,
-            criterion=criterion,
-            max_depth=1,
-        ).fit(Xtr, ytr)
-
-        report(
-            f"AdaBoost SAMME | {criterion} | stumps depth=1 "
-            f"| retained={len(boost1.trees)}",
-            boost1,
-            Xtr, ytr,
-            Xte, yte,
-            fte, mapping,
-        )
-
+        # Aggregate weighted votes
+        scores = np.zeros((len(X), self.K))
+        for alpha, tree in self.models:
+            preds = tree.predict(X)
+            # Add alpha to the predicted class score for each sample
+            scores[np.arange(len(X)), preds] += alpha
+            
+        # Tie-breaking defaults to smallest class label due to argmax behavior
+        return np.argmax(scores, axis=1)
 
 if __name__ == "__main__":
-    main()
+    # Note: load_data now returns 3 variables
+    X, y_species, y_family, family_classes = load_data()
+    train_idx, test_idx = stratified_split(y_species, test_frac=0.2, seed=42)
+    X_train, y_train, X_test, y_test = X[train_idx], y_species[train_idx], X[test_idx], y_species[test_idx]
+    
+    # Build mapping from train only
+    species_to_family = get_species_to_family(y_train, y_family[train_idx])
+    y_family_test = y_family[test_idx]
+    
+    print("=== Bagging (T=25, max_depth=None) ===")
+    for criterion in ["gini", "entropy"]:
+        bagging = Bagging(criterion=criterion)
+        bagging.fit(X_train, y_train)
+        
+        train_acc = get_accuracy(y_train, bagging.predict(X_train)) * 100
+        preds_test = bagging.predict(X_test)
+        test_acc = get_accuracy(y_test, preds_test) * 100
+        family_acc = get_accuracy(y_family_test, np.array([species_to_family[p] for p in preds_test])) * 100
+        
+        print(f"Criterion: {criterion.capitalize()}")
+        print(f"  Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | Derived Family Acc: {family_acc:.2f}%")
+
+    print("\n=== AdaBoost SAMME (T=50) ===")
+    for criterion in ["gini", "entropy"]:
+        # Standard requirement (max_depth=3)
+        adaboost = AdaBoostSAMME(criterion=criterion, max_depth=3)
+        adaboost.fit(X_train, y_train)
+        
+        train_acc = get_accuracy(y_train, adaboost.predict(X_train)) * 100
+        preds_test = adaboost.predict(X_test)
+        test_acc = get_accuracy(y_test, preds_test) * 100
+        family_acc = get_accuracy(y_family_test, np.array([species_to_family[p] for p in preds_test])) * 100
+        
+        # Stumps analysis requirement (max_depth=1)
+        stump_boost = AdaBoostSAMME(criterion=criterion, max_depth=1)
+        stump_boost.fit(X_train, y_train)
+        
+        stump_train_acc = get_accuracy(y_train, stump_boost.predict(X_train)) * 100
+        stump_preds_test = stump_boost.predict(X_test)
+        stump_test_acc = get_accuracy(y_test, stump_preds_test) * 100
+        stump_family_acc = get_accuracy(y_family_test, np.array([species_to_family[p] for p in stump_preds_test])) * 100
+        
+        print(f"Criterion: {criterion.capitalize()}")
+        print(f"  Depth=3 -> Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | Derived Family Acc: {family_acc:.2f}%")
+        print(f"  Depth=1 -> Train Acc: {stump_train_acc:.2f}% | Test Acc: {stump_test_acc:.2f}% | Derived Family Acc: {stump_family_acc:.2f}%\n")
