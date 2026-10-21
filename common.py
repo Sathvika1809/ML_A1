@@ -63,9 +63,21 @@ def confusion_matrix_numpy(y_true, y_pred, labels=None):
 
 
 def print_confusion_matrix(cm, labels, title):
+    """Print a confusion matrix with clearly aligned numeric columns."""
+    cm = np.asarray(cm)
+
     print(f"\n{title} (rows=true, columns=predicted):")
-    print("labels:", " | ".join(map(str, labels)))
-    print(cm)
+    print("Labels:", " | ".join(map(str, labels)))
+
+    column_width = max(
+        5,
+        max(len(str(int(value))) for value in cm.flat) + 2,
+    )
+
+    for row in cm:
+        print(" ".join(f"{int(value):>{column_width}d}" for value in row))
+
+
 
 
 def species_family_mapping(train_species, train_family):
